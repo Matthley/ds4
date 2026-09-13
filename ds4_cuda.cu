@@ -148,6 +148,12 @@ typedef struct {
     uint64_t gate_capacity;
     uint64_t up_capacity;
     uint64_t down_capacity;
+    /* When all selected experts are resident, kernels address the resident
+     * slabs directly.  Keep these separate from the owned compact buffers. */
+    int resident_direct;
+    char *resident_gate_ptr;
+    char *resident_up_ptr;
+    char *resident_down_ptr;
     int32_t *slot_selected_ptr;
     uint64_t slot_selected_capacity;
     ds4_gpu_tensor slot_selected_tensor;
@@ -172,6 +178,7 @@ typedef struct {
     uint64_t    last_used;
     uint32_t    layer;
     uint32_t    expert;
+    uint32_t    slot;
     char       *gate_ptr;
     char       *up_ptr;
     char       *down_ptr;
@@ -185,6 +192,12 @@ static uint64_t g_stream_resident_expert_clock;
 static uint64_t g_stream_resident_expert_hits;
 static uint64_t g_stream_resident_expert_misses;
 static uint64_t g_stream_resident_expert_evictions;
+static char *g_stream_resident_gate_slab;
+static char *g_stream_resident_up_slab;
+static char *g_stream_resident_down_slab;
+static uint64_t g_stream_resident_gate_bytes;
+static uint64_t g_stream_resident_down_bytes;
+static uint32_t g_stream_resident_slab_slots;
 
 static void cuda_stream_resident_expert_cache_release(void) {
     if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE") &&
@@ -199,12 +212,16 @@ static void cuda_stream_resident_expert_cache_release(void) {
                 (unsigned long long)g_stream_resident_expert_misses,
                 (unsigned long long)g_stream_resident_expert_evictions);
     }
-    for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
-        if (e.gate_ptr) (void)cudaFree(e.gate_ptr);
-        if (e.up_ptr) (void)cudaFree(e.up_ptr);
-        if (e.down_ptr) (void)cudaFree(e.down_ptr);
-    }
+    if (g_stream_resident_gate_slab) (void)cudaFree(g_stream_resident_gate_slab);
+    if (g_stream_resident_up_slab) (void)cudaFree(g_stream_resident_up_slab);
+    if (g_stream_resident_down_slab) (void)cudaFree(g_stream_resident_down_slab);
     g_stream_resident_experts.clear();
+    g_stream_resident_gate_slab = NULL;
+    g_stream_resident_up_slab = NULL;
+    g_stream_resident_down_slab = NULL;
+    g_stream_resident_gate_bytes = 0;
+    g_stream_resident_down_bytes = 0;
+    g_stream_resident_slab_slots = 0;
     g_stream_resident_expert_clock = 0;
     g_stream_resident_expert_hits = 0;
     g_stream_resident_expert_misses = 0;
@@ -252,6 +269,19 @@ typedef struct {
 } cuda_score_split_graph_cache;
 
 static cuda_score_split_graph_cache g_score_split_graph[DS4_MAX_GPUS];
+static char *cuda_stream_selected_gate_weight(void) {
+    return g_stream_selected_cache.resident_direct ?
+        g_stream_selected_cache.resident_gate_ptr : g_stream_selected_cache.gate_ptr;
+}
+static char *cuda_stream_selected_up_weight(void) {
+    return g_stream_selected_cache.resident_direct ?
+        g_stream_selected_cache.resident_up_ptr : g_stream_selected_cache.up_ptr;
+}
+static char *cuda_stream_selected_down_weight(void) {
+    return g_stream_selected_cache.resident_direct ?
+        g_stream_selected_cache.resident_down_ptr : g_stream_selected_cache.down_ptr;
+}
+
 static void attention_decode_score_split_graph_destroy_one(int logical_tier);
 
 typedef struct {
@@ -24375,15 +24405,15 @@ static int routed_moe_launch(
         const uint32_t weight_experts = use_stream_selected_cache ?
             g_stream_selected_cache.compact_count : n_total_expert;
         const char *gate_w = use_stream_selected_cache ?
-            g_stream_selected_cache.gate_ptr :
+            cuda_stream_selected_gate_weight() :
             cuda_resolve_weight_ptr(model_map, gate_offset, gate_total,
                                     logical_tier, "mxfp4 moe gate");
         const char *up_w = use_stream_selected_cache ?
-            g_stream_selected_cache.up_ptr :
+            cuda_stream_selected_up_weight() :
             cuda_resolve_weight_ptr(model_map, up_offset, gate_total,
                                     logical_tier, "mxfp4 moe up");
         const char *down_w = use_stream_selected_cache ?
-            g_stream_selected_cache.down_ptr :
+            cuda_stream_selected_down_weight() :
             cuda_resolve_weight_ptr(model_map, down_offset, down_total,
                                     logical_tier, "mxfp4 moe down");
         if (!gate_w || !up_w || !down_w || weight_experts == 0u) return 0;
@@ -24494,13 +24524,13 @@ static int routed_moe_launch(
         const uint32_t mmq_expert_count = use_stream_selected_cache ?
             g_stream_selected_cache.compact_count : n_total_expert;
         const char *gate_w = use_stream_selected_cache ?
-            g_stream_selected_cache.gate_ptr :
+            cuda_stream_selected_gate_weight() :
             cuda_resolve_weight_ptr(model_map, gate_offset, gate_total, mmq_tier, "moe gate mmq");
         const char *up_w = gate_w ? (use_stream_selected_cache ?
-            g_stream_selected_cache.up_ptr :
+            cuda_stream_selected_up_weight() :
             cuda_resolve_weight_ptr(model_map, up_offset, gate_total, mmq_tier, "moe up mmq")) : NULL;
         const char *down_w = up_w ? (use_stream_selected_cache ?
-            g_stream_selected_cache.down_ptr :
+            cuda_stream_selected_down_weight() :
             cuda_resolve_weight_ptr(model_map, down_offset, down_total, mmq_tier, "moe down mmq")) : NULL;
         if (down_w) {
             const uint64_t n_assignments = (uint64_t)n_tokens * n_expert;
@@ -24598,15 +24628,15 @@ static int routed_moe_launch(
         selected = &g_stream_selected_cache.slot_selected_tensor;
     }
     const char *gate_w = use_stream_selected_cache ?
-        g_stream_selected_cache.gate_ptr :
+        cuda_stream_selected_gate_weight() :
         cuda_resolve_weight_ptr(model_map, gate_offset, gate_bytes,
                                 logical_tier, "moe_gate");
     const char *up_w = use_stream_selected_cache ?
-        g_stream_selected_cache.up_ptr :
+        cuda_stream_selected_up_weight() :
         cuda_resolve_weight_ptr(model_map, up_offset, gate_bytes,
                                 logical_tier, "moe_up");
     const char *down_w = use_stream_selected_cache ?
-        g_stream_selected_cache.down_ptr :
+        cuda_stream_selected_down_weight() :
         cuda_resolve_weight_ptr(model_map, down_offset, down_bytes,
                                 logical_tier, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
@@ -26770,35 +26800,44 @@ static int cuda_stream_resident_expert_matches(
            e->down_expert_bytes == table->down_expert_bytes;
 }
 
-static int cuda_stream_resident_expert_alloc(
-        cuda_stream_resident_expert *e,
+static int cuda_stream_resident_expert_slab_ensure(
         uint64_t gate_bytes,
         uint64_t down_bytes) {
-    if (!e || gate_bytes == 0 || down_bytes == 0 ||
-        gate_bytes > (uint64_t)SIZE_MAX || down_bytes > (uint64_t)SIZE_MAX) {
+    if (gate_bytes == 0 || down_bytes == 0 ||
+        g_stream_resident_expert_budget == 0 ||
+        gate_bytes > UINT64_MAX / g_stream_resident_expert_budget ||
+        down_bytes > UINT64_MAX / g_stream_resident_expert_budget) {
         return 0;
     }
-    if (e->gate_ptr && e->up_ptr && e->down_ptr &&
-        e->gate_expert_bytes == gate_bytes &&
-        e->down_expert_bytes == down_bytes) {
+    if (g_stream_resident_gate_slab && g_stream_resident_up_slab &&
+        g_stream_resident_down_slab &&
+        g_stream_resident_gate_bytes == gate_bytes &&
+        g_stream_resident_down_bytes == down_bytes &&
+        g_stream_resident_slab_slots == g_stream_resident_expert_budget) {
         return 1;
     }
-    if (e->gate_ptr) (void)cudaFree(e->gate_ptr);
-    if (e->up_ptr) (void)cudaFree(e->up_ptr);
-    if (e->down_ptr) (void)cudaFree(e->down_ptr);
-    e->gate_ptr = e->up_ptr = e->down_ptr = NULL;
-    e->valid = 0;
-    if (cudaMalloc((void **)&e->gate_ptr, (size_t)gate_bytes) != cudaSuccess ||
-        cudaMalloc((void **)&e->up_ptr, (size_t)gate_bytes) != cudaSuccess ||
-        cudaMalloc((void **)&e->down_ptr, (size_t)down_bytes) != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA streaming resident-expert allocation failed: %s\n",
-                cudaGetErrorString(cudaGetLastError()));
-        if (e->gate_ptr) (void)cudaFree(e->gate_ptr);
-        if (e->up_ptr) (void)cudaFree(e->up_ptr);
-        if (e->down_ptr) (void)cudaFree(e->down_ptr);
-        e->gate_ptr = e->up_ptr = e->down_ptr = NULL;
+    const uint64_t gate_total =
+        (uint64_t)g_stream_resident_expert_budget * gate_bytes;
+    const uint64_t down_total =
+        (uint64_t)g_stream_resident_expert_budget * down_bytes;
+    if (gate_total > (uint64_t)SIZE_MAX || down_total > (uint64_t)SIZE_MAX) {
         return 0;
     }
+    cuda_stream_resident_expert_cache_release();
+    if (cudaMalloc((void **)&g_stream_resident_gate_slab,
+                   (size_t)gate_total) != cudaSuccess ||
+        cudaMalloc((void **)&g_stream_resident_up_slab,
+                   (size_t)gate_total) != cudaSuccess ||
+        cudaMalloc((void **)&g_stream_resident_down_slab,
+                   (size_t)down_total) != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA streaming resident-expert slab allocation failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        cuda_stream_resident_expert_cache_release();
+        return 0;
+    }
+    g_stream_resident_gate_bytes = gate_bytes;
+    g_stream_resident_down_bytes = down_bytes;
+    g_stream_resident_slab_slots = g_stream_resident_expert_budget;
     return 1;
 }
 
@@ -26807,6 +26846,10 @@ static cuda_stream_resident_expert *cuda_stream_resident_expert_load(
         uint32_t expert) {
     if (!table || expert >= table->n_total_expert ||
         g_stream_resident_expert_budget == 0) {
+        return NULL;
+    }
+    if (!cuda_stream_resident_expert_slab_ensure(table->gate_expert_bytes,
+                                                  table->down_expert_bytes)) {
         return NULL;
     }
     for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
@@ -26821,6 +26864,7 @@ static cuda_stream_resident_expert *cuda_stream_resident_expert_load(
     cuda_stream_resident_expert *entry = NULL;
     if (g_stream_resident_experts.size() < g_stream_resident_expert_budget) {
         g_stream_resident_experts.push_back({});
+        g_stream_resident_experts.back().slot = g_stream_resident_experts.size() - 1;
         entry = &g_stream_resident_experts.back();
     } else {
         for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
@@ -26829,10 +26873,12 @@ static cuda_stream_resident_expert *cuda_stream_resident_expert_load(
         if (!entry) return NULL;
         g_stream_resident_expert_evictions++;
     }
-    if (!cuda_stream_resident_expert_alloc(entry, table->gate_expert_bytes,
-                                             table->down_expert_bytes)) {
-        return NULL;
-    }
+    entry->gate_ptr = g_stream_resident_gate_slab +
+        (uint64_t)entry->slot * table->gate_expert_bytes;
+    entry->up_ptr = g_stream_resident_up_slab +
+        (uint64_t)entry->slot * table->gate_expert_bytes;
+    entry->down_ptr = g_stream_resident_down_slab +
+        (uint64_t)entry->slot * table->down_expert_bytes;
     const uint64_t gate_src = table->gate_offset +
                               (uint64_t)expert * table->gate_expert_bytes;
     const uint64_t up_src = table->up_offset +
@@ -26952,7 +26998,31 @@ static int cuda_stream_selected_cache_begin_load(
         return 0;
     }
 
-    for (uint32_t i = 0; i < compact_ids.size(); i++) {
+    int resident_direct =
+        g_stream_resident_expert_budget != 0 &&
+        compact_count <= g_stream_resident_expert_budget;
+    std::vector<cuda_stream_resident_expert *> resident_entries;
+    if (resident_direct) {
+        try {
+            resident_entries.reserve(compact_count);
+        } catch (...) {
+            resident_direct = 0;
+        }
+        for (uint32_t i = 0; resident_direct && i < compact_ids.size(); i++) {
+            cuda_stream_resident_expert *resident =
+                cuda_stream_resident_expert_load(table, (uint32_t)compact_ids[i]);
+            if (!resident) resident_direct = 0;
+            else resident_entries.push_back(resident);
+        }
+        if (resident_direct) {
+            for (uint32_t i = 0; i < compact_ids.size(); i++)
+                expert_to_slot[(uint32_t)compact_ids[i]] = (int32_t)resident_entries[i]->slot;
+            for (uint32_t i = 0; i < slot_count; i++)
+                slot_ids[i] = expert_to_slot[(uint32_t)selected_ids[i]];
+        }
+    }
+
+    if (!resident_direct) for (uint32_t i = 0; i < compact_ids.size(); i++) {
         const uint32_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
@@ -26991,6 +27061,12 @@ static int cuda_stream_selected_cache_begin_load(
             return 0;
         }
     }
+    if (resident_direct) {
+        g_stream_selected_cache.resident_direct = 1;
+        g_stream_selected_cache.resident_gate_ptr = g_stream_resident_gate_slab;
+        g_stream_selected_cache.resident_up_ptr = g_stream_resident_up_slab;
+        g_stream_selected_cache.resident_down_ptr = g_stream_resident_down_slab;
+    }
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids.data(),
                             (size_t)slot_count * sizeof(int32_t),
@@ -27005,7 +27081,8 @@ static int cuda_stream_selected_cache_begin_load(
     g_stream_selected_cache.layer = table->layer;
     g_stream_selected_cache.n_total_expert = table->n_total_expert;
     g_stream_selected_cache.slot_count = slot_count;
-    g_stream_selected_cache.compact_count = (uint32_t)compact_count;
+    g_stream_selected_cache.compact_count = resident_direct ?
+        g_stream_resident_expert_budget : (uint32_t)compact_count;
     g_stream_selected_cache.gate_offset = table->gate_offset;
     g_stream_selected_cache.up_offset = table->up_offset;
     g_stream_selected_cache.down_offset = table->down_offset;
