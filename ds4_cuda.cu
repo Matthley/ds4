@@ -155,6 +155,62 @@ typedef struct {
 
 static cuda_stream_selected_cache g_stream_selected_cache;
 
+/* CUDA keeps the compact, currently-selected expert set separately below.
+ * This cache is the long-lived part controlled by
+ * --ssd-streaming-cache-experts: an entry is one gate/up/down expert triplet
+ * identified by its model, layer and expert number.  The compact buffers are
+ * filled from these entries on a hit, so the MMQ kernels retain their compact
+ * address-table interface. */
+typedef struct {
+    const void *model_map;
+    uint64_t    model_size;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+    uint64_t    gate_expert_bytes;
+    uint64_t    down_expert_bytes;
+    uint64_t    last_used;
+    uint32_t    layer;
+    uint32_t    expert;
+    char       *gate_ptr;
+    char       *up_ptr;
+    char       *down_ptr;
+    int         valid;
+} cuda_stream_resident_expert;
+
+static std::vector<cuda_stream_resident_expert> g_stream_resident_experts;
+static uint32_t g_stream_resident_expert_budget;
+static uint64_t g_stream_resident_expert_size_hint;
+static uint64_t g_stream_resident_expert_clock;
+static uint64_t g_stream_resident_expert_hits;
+static uint64_t g_stream_resident_expert_misses;
+static uint64_t g_stream_resident_expert_evictions;
+
+static void cuda_stream_resident_expert_cache_release(void) {
+    if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE") &&
+        (g_stream_resident_expert_hits != 0 ||
+         g_stream_resident_expert_misses != 0 ||
+         !g_stream_resident_experts.empty())) {
+        fprintf(stderr,
+                "ds4: CUDA streaming resident expert cache budget=%u entries=%zu hits=%llu misses=%llu evictions=%llu\n",
+                g_stream_resident_expert_budget,
+                g_stream_resident_experts.size(),
+                (unsigned long long)g_stream_resident_expert_hits,
+                (unsigned long long)g_stream_resident_expert_misses,
+                (unsigned long long)g_stream_resident_expert_evictions);
+    }
+    for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
+        if (e.gate_ptr) (void)cudaFree(e.gate_ptr);
+        if (e.up_ptr) (void)cudaFree(e.up_ptr);
+        if (e.down_ptr) (void)cudaFree(e.down_ptr);
+    }
+    g_stream_resident_experts.clear();
+    g_stream_resident_expert_clock = 0;
+    g_stream_resident_expert_hits = 0;
+    g_stream_resident_expert_misses = 0;
+    g_stream_resident_expert_evictions = 0;
+}
+
 static void cuda_stream_selected_cache_invalidate(void) {
     g_stream_selected_cache.valid = 0;
 }
@@ -2835,6 +2891,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     cuda_stream_selected_cache_release();
+    cuda_stream_resident_expert_cache_release();
     cuda_stream_selected_stage_release();
     g_n_gpus = 0;
     g_device_is_spark = false;
@@ -3710,6 +3767,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (!model_map || model_size == 0) return 0;
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
     cuda_stream_selected_cache_release();
+    cuda_stream_resident_expert_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -3883,6 +3941,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
 
     cuda_stream_selected_cache_release();
+    cuda_stream_resident_expert_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -26699,6 +26758,123 @@ static int cuda_stream_selected_ranges_valid(
            down_bytes <= table->model_size - table->down_offset;
 }
 
+static int cuda_stream_resident_expert_matches(
+        const cuda_stream_resident_expert *e,
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t expert) {
+    return e && e->valid && e->model_map == table->model_map &&
+           e->model_size == table->model_size && e->layer == table->layer &&
+           e->expert == expert && e->gate_offset == table->gate_offset &&
+           e->up_offset == table->up_offset && e->down_offset == table->down_offset &&
+           e->gate_expert_bytes == table->gate_expert_bytes &&
+           e->down_expert_bytes == table->down_expert_bytes;
+}
+
+static int cuda_stream_resident_expert_alloc(
+        cuda_stream_resident_expert *e,
+        uint64_t gate_bytes,
+        uint64_t down_bytes) {
+    if (!e || gate_bytes == 0 || down_bytes == 0 ||
+        gate_bytes > (uint64_t)SIZE_MAX || down_bytes > (uint64_t)SIZE_MAX) {
+        return 0;
+    }
+    if (e->gate_ptr && e->up_ptr && e->down_ptr &&
+        e->gate_expert_bytes == gate_bytes &&
+        e->down_expert_bytes == down_bytes) {
+        return 1;
+    }
+    if (e->gate_ptr) (void)cudaFree(e->gate_ptr);
+    if (e->up_ptr) (void)cudaFree(e->up_ptr);
+    if (e->down_ptr) (void)cudaFree(e->down_ptr);
+    e->gate_ptr = e->up_ptr = e->down_ptr = NULL;
+    e->valid = 0;
+    if (cudaMalloc((void **)&e->gate_ptr, (size_t)gate_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&e->up_ptr, (size_t)gate_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&e->down_ptr, (size_t)down_bytes) != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA streaming resident-expert allocation failed: %s\n",
+                cudaGetErrorString(cudaGetLastError()));
+        if (e->gate_ptr) (void)cudaFree(e->gate_ptr);
+        if (e->up_ptr) (void)cudaFree(e->up_ptr);
+        if (e->down_ptr) (void)cudaFree(e->down_ptr);
+        e->gate_ptr = e->up_ptr = e->down_ptr = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+static cuda_stream_resident_expert *cuda_stream_resident_expert_load(
+        const ds4_gpu_stream_expert_table *table,
+        uint32_t expert) {
+    if (!table || expert >= table->n_total_expert ||
+        g_stream_resident_expert_budget == 0) {
+        return NULL;
+    }
+    for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
+        if (cuda_stream_resident_expert_matches(&e, table, expert)) {
+            e.last_used = ++g_stream_resident_expert_clock;
+            g_stream_resident_expert_hits++;
+            return &e;
+        }
+    }
+
+    g_stream_resident_expert_misses++;
+    cuda_stream_resident_expert *entry = NULL;
+    if (g_stream_resident_experts.size() < g_stream_resident_expert_budget) {
+        g_stream_resident_experts.push_back({});
+        entry = &g_stream_resident_experts.back();
+    } else {
+        for (cuda_stream_resident_expert &e : g_stream_resident_experts) {
+            if (!entry || e.last_used < entry->last_used) entry = &e;
+        }
+        if (!entry) return NULL;
+        g_stream_resident_expert_evictions++;
+    }
+    if (!cuda_stream_resident_expert_alloc(entry, table->gate_expert_bytes,
+                                             table->down_expert_bytes)) {
+        return NULL;
+    }
+    const uint64_t gate_src = table->gate_offset +
+                              (uint64_t)expert * table->gate_expert_bytes;
+    const uint64_t up_src = table->up_offset +
+                            (uint64_t)expert * table->gate_expert_bytes;
+    const uint64_t down_src = table->down_offset +
+                              (uint64_t)expert * table->down_expert_bytes;
+    if (!cuda_model_copy_to_device_streamed(entry->gate_ptr, table->model_map,
+                                             table->model_size, gate_src,
+                                             table->gate_expert_bytes,
+                                             "resident gate expert copy") ||
+        !cuda_model_copy_to_device_streamed(entry->up_ptr, table->model_map,
+                                             table->model_size, up_src,
+                                             table->gate_expert_bytes,
+                                             "resident up expert copy") ||
+        !cuda_model_copy_to_device_streamed(entry->down_ptr, table->model_map,
+                                             table->model_size, down_src,
+                                             table->down_expert_bytes,
+                                             "resident down expert copy")) {
+        entry->valid = 0;
+        return NULL;
+    }
+    entry->model_map = table->model_map;
+    entry->model_size = table->model_size;
+    entry->gate_offset = table->gate_offset;
+    entry->up_offset = table->up_offset;
+    entry->down_offset = table->down_offset;
+    entry->gate_expert_bytes = table->gate_expert_bytes;
+    entry->down_expert_bytes = table->down_expert_bytes;
+    entry->layer = table->layer;
+    entry->expert = expert;
+    entry->last_used = ++g_stream_resident_expert_clock;
+    entry->valid = 1;
+    return entry;
+}
+
+static int cuda_stream_copy_from_resident(
+        char *dst, const char *src, uint64_t bytes, const char *what) {
+    if (!dst || !src || bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
+    return cuda_ok(cudaMemcpy(dst, src, (size_t)bytes, cudaMemcpyDeviceToDevice),
+                   what);
+}
+
 static int cuda_stream_selected_cache_begin_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
@@ -26777,30 +26953,40 @@ static int cuda_stream_selected_cache_begin_load(
     }
 
     for (uint32_t i = 0; i < compact_ids.size(); i++) {
-        const uint64_t expert = (uint32_t)compact_ids[i];
-        const uint64_t gate_src =
-            table->gate_offset + expert * table->gate_expert_bytes;
-        const uint64_t up_src =
-            table->up_offset + expert * table->gate_expert_bytes;
-        const uint64_t down_src =
-            table->down_offset + expert * table->down_expert_bytes;
+        const uint32_t expert = (uint32_t)compact_ids[i];
         const uint64_t gate_dst = (uint64_t)i * table->gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)i * table->down_expert_bytes;
-        if (!cuda_model_copy_to_device_streamed(
+        cuda_stream_resident_expert *resident =
+            cuda_stream_resident_expert_load(table, expert);
+        const int copied = resident ?
+            (cuda_stream_copy_from_resident(
+                    g_stream_selected_cache.gate_ptr + gate_dst,
+                    resident->gate_ptr, table->gate_expert_bytes,
+                    "resident gate expert copy") &&
+             cuda_stream_copy_from_resident(
+                    g_stream_selected_cache.up_ptr + gate_dst,
+                    resident->up_ptr, table->gate_expert_bytes,
+                    "resident up expert copy") &&
+             cuda_stream_copy_from_resident(
+                    g_stream_selected_cache.down_ptr + down_dst,
+                    resident->down_ptr, table->down_expert_bytes,
+                    "resident down expert copy")) :
+            (cuda_model_copy_to_device_streamed(
                     g_stream_selected_cache.gate_ptr + gate_dst,
                     table->model_map, table->model_size,
-                    gate_src, table->gate_expert_bytes,
-                    "stream gate expert copy") ||
-            !cuda_model_copy_to_device_streamed(
+                    table->gate_offset + (uint64_t)expert * table->gate_expert_bytes,
+                    table->gate_expert_bytes, "stream gate expert copy") &&
+             cuda_model_copy_to_device_streamed(
                     g_stream_selected_cache.up_ptr + gate_dst,
                     table->model_map, table->model_size,
-                    up_src, table->gate_expert_bytes,
-                    "stream up expert copy") ||
-            !cuda_model_copy_to_device_streamed(
+                    table->up_offset + (uint64_t)expert * table->gate_expert_bytes,
+                    table->gate_expert_bytes, "stream up expert copy") &&
+             cuda_model_copy_to_device_streamed(
                     g_stream_selected_cache.down_ptr + down_dst,
                     table->model_map, table->model_size,
-                    down_src, table->down_expert_bytes,
-                    "stream down expert copy")) {
+                    table->down_offset + (uint64_t)expert * table->down_expert_bytes,
+                    table->down_expert_bytes, "stream down expert copy"));
+        if (!copied) {
             cuda_stream_selected_cache_invalidate();
             return 0;
         }
@@ -32953,24 +33139,40 @@ extern "C" void ds4_gpu_set_glm_model(bool enabled) {
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_ssd_streaming_mode = enabled ? 1 : 0;
     cuda_stream_selected_cache_invalidate();
-    if (!g_ssd_streaming_mode) cuda_stream_selected_cache_release();
+    if (!g_ssd_streaming_mode) {
+        cuda_stream_selected_cache_release();
+        cuda_stream_resident_expert_cache_release();
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    (void)experts;
+    if (experts == g_stream_resident_expert_budget) return;
+    (void)cudaDeviceSynchronize();
+    cuda_stream_resident_expert_cache_release();
+    g_stream_resident_expert_budget = experts;
+    if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA streaming resident expert cache budget=%u\n",
+                experts);
+    }
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
-    (void)bytes;
+    if (bytes == g_stream_resident_expert_size_hint) return;
+    (void)cudaDeviceSynchronize();
+    cuda_stream_resident_expert_cache_release();
+    g_stream_resident_expert_size_hint = bytes;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return 0;
+    return g_stream_resident_expert_budget;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return g_stream_selected_cache.valid ?
-        g_stream_selected_cache.compact_count : 0;
+    uint32_t count = 0;
+    for (const cuda_stream_resident_expert &e : g_stream_resident_experts) {
+        if (e.valid) count++;
+    }
+    return count;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -32978,13 +33180,21 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
 
 extern "C" void ds4_gpu_stream_expert_cache_release_resident(void) {
     cuda_stream_selected_cache_release();
+    cuda_stream_resident_expert_cache_release();
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
         const ds4_gpu_stream_expert_table *table,
         const int32_t *selected_ids,
         uint32_t n_selected) {
-    (void)table; (void)selected_ids; (void)n_selected;
+    if (!cuda_stream_selected_ranges_valid(table) || !selected_ids) return 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (selected_ids[i] < 0 ||
+            (uint32_t)selected_ids[i] >= table->n_total_expert ||
+            !cuda_stream_resident_expert_load(table, (uint32_t)selected_ids[i])) {
+            return 0;
+        }
+    }
     return 1;
 }
 
@@ -33006,7 +33216,15 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
         const int32_t *expert_ids,
         const uint32_t *expert_priorities,
         uint32_t n_experts) {
-    (void)table; (void)expert_ids; (void)expert_priorities; (void)n_experts;
+    (void)expert_priorities;
+    if (!cuda_stream_selected_ranges_valid(table) || !expert_ids) return 0;
+    for (uint32_t i = 0; i < n_experts; i++) {
+        if (expert_ids[i] < 0 ||
+            (uint32_t)expert_ids[i] >= table->n_total_expert ||
+            !cuda_stream_resident_expert_load(table, (uint32_t)expert_ids[i])) {
+            return 0;
+        }
+    }
     return 1;
 }
 
